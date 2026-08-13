@@ -1,13 +1,22 @@
+CC ?= cc
+CFLAGS ?= -O2
+LDFLAGS ?=
+
 all: jp_alloc.so jp_allocd.so
 
 jp_alloc.so: jp_alloc.o
-	g++ -shared -o $@ $^
+	$(CC) -shared -o $@ $^
 
 jp_allocd.so: jp_allocd.o
-	g++ -shared -g -ggdb -o $@ $^
+	$(CC) -shared -g -ggdb -o $@ $^
 
-%.o: %.cpp makefile
-	g++ -std=c++20 -c -O2 -fpic -c -o $@ $<
+%.o: %.c jp_alloc.h makefile
+	$(CC) -std=c11 -fpic -c $(CFLAGS) -DJP_ALLOC_IMPLEMENTATION -o $@ $<
 
-%d.o: %.cpp makefile
-	g++ -std=c++20 -c -g -ggdb -fpic -DDEBUG -o $@ $<
+%d.o: %.c jp_alloc.h makefile
+	$(CC) -std=c11 -fpic -c -g -ggdb $(CFLAGS) -DJP_ALLOC_IMPLEMENTATION -DJP_ALLOC_DEBUG -o $@ $<
+
+clean:
+	rm -f jp_alloc.so jp_allocd.so jp_alloc.o jp_allocd.o
+
+.PHONY: all clean
