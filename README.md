@@ -155,7 +155,12 @@ LD_PRELOAD=./jp_alloc.so your_program
 ```
 
 This overrides `malloc`/`free`/`calloc`/`realloc` globally, so all
-allocations in the process route through jp_alloc's pools.
+allocations in the process route through jp_alloc's pools. For C++
+programs, the Makefile also builds a C++ shim (`jp_alloc_cpp.cpp`) that
+overrides global `operator new`/`delete`/`new[]`/`delete[]` (including
+the C++14 sized and C++17 aligned variants), so `new`/`delete` goes
+directly to jp_alloc instead of indirectly via libc malloc. The shim is
+only compiled if a C++ compiler is available.
 
 ### Linked directly
 
@@ -171,6 +176,14 @@ free(buf);
 void *aligned = jp_alloc_aligned(64, 1024);
 jp_free(aligned);
 size_t sz = jp_good_size(100); /* actual block size for a request */
+```
+
+For C++ programs, link `jp_alloc_cpp.o` alongside `jp_alloc.o` to
+override `operator new`/`delete` directly:
+
+```sh
+g++ -std=c++17 -c jp_alloc_cpp.cpp -o jp_alloc_cpp.o
+g++ your_program.cpp jp_alloc.o jp_alloc_cpp.o -lpthread -lm
 ```
 
 ### Debug mode
