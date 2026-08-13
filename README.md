@@ -69,12 +69,12 @@ remaining ~8MB stays untouched and costs **no physical RSS** under demand
 paging (the OS only allocates physical memory when a page is actually
 read or written).
 
-The cascade frequency is exponential: pool N drains 16× less often than
-pool N-1 (each split produces 1 spare at each intermediate pool, serving
-~16 future allocations before the next drain). So the additional pools
-(17-23) essentially never drain for most workloads — their 8MB mmap is
-a one-time event, and future allocations reuse spares from intermediate
-pools.
+The cascade frequency is exponential: pool N drains 2× less often than
+pool N-1 (each split produces 2 blocks, serving 2 future allocations
+before the next drain). So the additional pools (17-23) drain
+2^(N-6) ≈ 131K times less often than pool 6 — essentially never for
+most workloads. Their 8MB mmap is a one-time event, and future
+allocations reuse spares from intermediate pools.
 
 ## Performance
 
@@ -82,26 +82,14 @@ Benchmark: 300 threads, 50,000 operations per thread (15M total), mixed
 small-object alloc/free (80B, 48B, 256B, 128B with memset initialization)
 plus large malloc/free churn (1KB–32KB). See `jp_alloc_bench.c`.
 
-### 300-thread balanced workload
-
-| Allocator    | Throughput | p99 latency | Peak RSS |
-|--------------|-----------|-------------|----------|
-| jp_alloc     | 24.9 Mops/s | 384 ns     | 36 MB    |
-| mimalloc     | 25.3 Mops/s | 768 ns     | 88 MB    |
-| jemalloc     | 21.4 Mops/s | 768 ns     | 46 MB    |
-| tcmalloc     | 17.2 Mops/s | 393 µs     | 145 MB   |
-| glibc malloc | 12.3 Mops/s | 1536 ns    | 23 MB    |
-
-### Thread count sweep (balanced)
-
-| Allocator  | 1 thread        | 8 threads       | 64 threads       | 300 threads       |
-|------------|-----------------|-----------------|------------------|-------------------|
-|            | Mops/s  RSS     | Mops/s  RSS     | Mops/s  RSS      | Mops/s  RSS       |
-| jp_alloc   | 4.31    2.0 MB  | 16.75   3.7 MB  | 24.93   13 MB    | 24.90   36 MB     |
-| mimalloc   | 5.83    2.3 MB  | 14.56   5.9 MB  | 22.19   28 MB    | 25.31   88 MB     |
-| jemalloc   | 4.40    3.5 MB  | 11.95   9.0 MB  | 20.51   21 MB    | 21.41   46 MB     |
-| tcmalloc   | 4.09    7.1 MB  | 11.14   9.7 MB  | 24.91   31 MB    | 17.22   145 MB    |
-| glibc      | 2.94    1.7 MB  | 10.10   2.8 MB  | 13.13   11 MB    | 12.28   23 MB     |
+| Allocator    | 1 thread        | 8 threads       | 64 threads       | 300 threads       |
+|--------------|-----------------|-----------------|------------------|-------------------|
+|              | Mops/s  RSS     | Mops/s  RSS     | Mops/s  RSS      | Mops/s  RSS       |
+| jp_alloc     | 4.31    2.0 MB  | 16.75   3.7 MB  | 24.93   13 MB    | 24.90   36 MB     |
+| mimalloc     | 5.83    2.3 MB  | 14.56   5.9 MB  | 22.19   28 MB    | 25.31   88 MB     |
+| jemalloc     | 4.40    3.5 MB  | 11.95   9.0 MB  | 20.51   21 MB    | 21.41   46 MB     |
+| tcmalloc     | 4.09    7.1 MB  | 11.14   9.7 MB  | 24.91   31 MB    | 17.22   145 MB    |
+| glibc malloc | 2.94    1.7 MB  | 10.10   2.8 MB  | 13.13   11 MB    | 12.28   23 MB     |
 
 **Throughput**: jp_alloc beats glibc by 103% and jemalloc by 16% at 300
 threads. At 8 threads jp_alloc is the fastest of all allocators (16.75
