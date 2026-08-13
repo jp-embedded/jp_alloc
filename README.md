@@ -57,9 +57,18 @@ past the batch. One CAS amortizes across ~16 future cache misses.
 
 ### Buddy splitting
 
-Memory is organized into power-of-2 size classes (1, 2, 4, ..., 65536 bytes).
+Memory is organized into power-of-2 size classes (1, 2, 4, ..., 524288 bytes).
 When a pool is empty, a block from the next-larger pool is split in half —
 one half is returned to the caller, the other goes into the empty pool.
+
+### Dynamic chunk allocation
+
+When the largest pool (512KB) is empty, instead of mmaping a single block,
+jp_alloc mmaps a **dynamically growing chunk** and carves it into buddy
+blocks. The chunk size starts at 1MB and grows by 25% each time this path
+is hit (`prev + prev/4`). This reduces the number of mmap syscalls (one
+large mmap instead of many small ones) without overshooting RSS — the
+growth is self-limiting and stops when the working set stabilizes.
 
 ## Performance
 
@@ -151,7 +160,7 @@ Compile-time flags (all optional):
 | `JP_ALLOC_DEBUG` | off | Enable ABA/double-free/corruption self-checks |
 | `JP_CACHE_N` | 32 | Per-thread cache slots per size class |
 | `JP_REFILL` | 16 | Blocks per global free list refill CAS |
-| `JP_ALLOC_POOL_COUNT` | 17 | Power-of-2 pool classes (1B..64K) |
+| `JP_ALLOC_POOL_COUNT` | 20 | Power-of-2 pool classes (1B..512K) |
 | `JP_CACHELINE` | 64 | Cache-line size for alignment padding |
 
 ## Platform support
