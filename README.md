@@ -78,34 +78,67 @@ allocations reuse spares from intermediate pools.
 
 ## Performance
 
-Benchmark: 300 threads, 50,000 operations per thread (15M total), mixed
-small-object alloc/free (80B, 48B, 256B, 128B with memset initialization)
-plus large malloc/free churn (1KB–32KB). See `jp_alloc_bench.c`.
+Benchmark: mixed small-object alloc/free (80B, 48B, 256B, 128B with memset
+initialization) plus large malloc/free churn (1KB–32KB), 50,000 operations
+per thread. See `jp_alloc_bench.c`.
 
-| Allocator    | 1 thread        | 8 threads       | 64 threads       | 300 threads       |
-|--------------|-----------------|-----------------|------------------|-------------------|
-|              | Mops/s  RSS     | Mops/s  RSS     | Mops/s  RSS      | Mops/s  RSS       |
-| jp_alloc     | 4.31    2.0 MB  | 16.75   3.7 MB  | 24.93   13 MB    | 24.90   36 MB     |
-| mimalloc     | 5.83    2.3 MB  | 14.56   5.9 MB  | 22.19   28 MB    | 25.31   88 MB     |
-| jemalloc     | 4.40    3.5 MB  | 11.95   9.0 MB  | 20.51   21 MB    | 21.41   46 MB     |
-| tcmalloc     | 4.09    7.1 MB  | 11.14   9.7 MB  | 24.91   31 MB    | 17.22   145 MB    |
-| glibc malloc | 2.94    1.7 MB  | 10.10   2.8 MB  | 13.13   11 MB    | 12.28   23 MB     |
+Test machine: Intel Core i5-8250U (4 cores / 8 threads), 16 GB RAM,
+Linux x86_64. All allocators built with `-O2` and tested via `LD_PRELOAD`.
+
+### 1 thread
+
+| Allocator    | Throughput | p99 latency | Peak RSS |
+|--------------|-----------|-------------|----------|
+| jp_alloc     | 4.31 Mops/s | 384 ns     | 2.0 MB   |
+| mimalloc     | 5.83 Mops/s | 768 ns     | 2.3 MB   |
+| jemalloc     | 4.40 Mops/s | 1536 ns    | 3.5 MB   |
+| tcmalloc     | 4.09 Mops/s | 768 ns     | 7.1 MB   |
+| glibc malloc | 2.94 Mops/s | 768 ns     | 1.7 MB   |
+
+### 8 threads
+
+| Allocator    | Throughput | p99 latency | Peak RSS |
+|--------------|-----------|-------------|----------|
+| jp_alloc     | 16.75 Mops/s | 768 ns    | 3.7 MB   |
+| mimalloc     | 14.56 Mops/s | 768 ns    | 5.9 MB   |
+| jemalloc     | 11.95 Mops/s | 768 ns    | 9.0 MB   |
+| tcmalloc     | 11.14 Mops/s | 1536 ns   | 9.7 MB   |
+| glibc malloc | 10.10 Mops/s | 1536 ns   | 2.8 MB   |
+
+### 64 threads
+
+| Allocator    | Throughput | p99 latency | Peak RSS |
+|--------------|-----------|-------------|----------|
+| jp_alloc     | 24.93 Mops/s | 768 ns    | 13 MB    |
+| tcmalloc     | 24.91 Mops/s | 768 ns    | 31 MB    |
+| mimalloc     | 22.19 Mops/s | 768 ns    | 28 MB    |
+| jemalloc     | 20.51 Mops/s | 768 ns    | 21 MB    |
+| glibc malloc | 13.13 Mops/s | 768 ns    | 11 MB    |
+
+### 300 threads
+
+| Allocator    | Throughput | p99 latency | Peak RSS |
+|--------------|-----------|-------------|----------|
+| jp_alloc     | 24.90 Mops/s | 384 ns     | 36 MB    |
+| mimalloc     | 25.31 Mops/s | 768 ns     | 88 MB    |
+| jemalloc     | 21.41 Mops/s | 768 ns     | 46 MB    |
+| tcmalloc     | 17.22 Mops/s | 196 µs     | 145 MB   |
+| glibc malloc | 12.28 Mops/s | 1536 ns    | 23 MB    |
 
 **Throughput**: jp_alloc beats glibc by 103% and jemalloc by 16% at 300
 threads. At 8 threads jp_alloc is the fastest of all allocators (16.75
 Mops/s). Only mimalloc edges jp_alloc at 300 threads (by 2%).
 
 **p99 latency**: jp_alloc has the lowest p99 of all tested allocators
-(384 ns at 300 threads — 2× better than jemalloc/mimalloc, 1000× better
-than tcmalloc).
+at 300 threads (384 ns — 2× better than jemalloc/mimalloc, 500× better
+than tcmalloc which spikes to 196 µs under heavy contention).
 
 **RSS**: jp_alloc uses the least physical memory among the fast
 allocators at every thread count. At 300 threads: 36 MB vs mimalloc 88 MB
 (2.4× less), jemalloc 46 MB (1.3× less), tcmalloc 145 MB (4× less).
 Only glibc is lighter (23 MB) but glibc is 2× slower.
 
-**p50/p99 latency** = median and 99th-percentile per-operation latency.
-Lower is better.
+**p99 latency** = 99th-percentile per-operation latency. Lower is better.
 
 **RSS** = peak resident set size (physical memory used). Only pages
 actually touched by buddy-split headers count toward RSS — untouched
