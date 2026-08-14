@@ -61,6 +61,26 @@ Memory is organized into power-of-2 size classes (1, 2, 4, ..., 8388608 bytes).
 When a pool is empty, a block from the next-larger pool is split in half —
 one half is returned to the caller, the other goes into the empty pool.
 
+### Magazines
+
+The global freelist for each pool is a linked list of **magazines** —
+each magazine is a struct holding 16 block pointers in an array. Refill
+pops one magazine (1 CAS) and memcpys 16 pointers into the TLS cache.
+Flush memcpys 16 pointers from the TLS cache into a magazine and
+CAS-pushes it to the global list. No dependent-load walks, no in-band
+chain-building loops.
+
+Magazines are allocated from the pool system (pool 8 = 256B blocks,
+which fit the ~136-byte magazine struct + 16-byte header). A CAS-based
+free-list recycles magazines — no static arrays, no mmap, no mutex.
+The first magazine allocation triggers one buddy-split from the 8MB
+pool reserve, populating ~16K magazines from a single mmap.
+
+Each thread keeps a unified stack of empty magazines across all pools.
+Refills push empty magazines here; flushes pop them. The stack stays
+small (~active pool count) because refills and flushes naturally
+alternate in balanced workloads.
+
 ### Demand paging and pool count
 
 The largest pool (8MB) is populated via a single `mmap`. The buddy-split
@@ -79,71 +99,73 @@ allocations reuse spares from intermediate pools.
 ## Performance
 
 Benchmark: mixed small-object alloc/free (80B, 48B, 256B, 128B with memset
-initialization) plus large malloc/free churn (1KB–32KB), 50,000 operations
-per thread. See `jp_alloc_bench.c`.
+initialization) plus large malloc/free churn (1KB–32KB), 10 second timed runs
+(steady state). See `jp_alloc_bench.c`.
 
 Test machine: Intel Core i5-8250U (4 cores / 8 threads), 16 GB RAM,
 Linux x86_64. All allocators built with `-O2` and tested via `LD_PRELOAD`.
+Results are median of 3 runs.
 
 ### 1 thread
 
-| Allocator    | Throughput | p99 latency | Peak RSS |
-|--------------|-----------|-------------|----------|
-| jp_alloc     | 4.31 Mops/s | 384 ns     | 2.0 MB   |
-| mimalloc     | 5.83 Mops/s | 768 ns     | 2.3 MB   |
-| jemalloc     | 4.40 Mops/s | 1536 ns    | 3.5 MB   |
-| tcmalloc     | 4.09 Mops/s | 768 ns     | 7.1 MB   |
-| glibc malloc | 2.94 Mops/s | 768 ns     | 1.7 MB   |
+| Allocator    | Throughput | Peak RSS |
+|--------------|-----------|----------|
+| jp_alloc     | 5.13 Mops/s | 2.1 MB   |
+| tcmalloc     | 5.33 Mops/s | 7.4 MB   |
+| mimalloc     | 4.75 Mops/s | 2.4 MB   |
+| jemalloc     | 3.68 Mops/s | 4.0 MB   |
+| glibc malloc | 2.27 Mops/s | 1.9 MB   |
 
 ### 8 threads
 
-| Allocator    | Throughput | p99 latency | Peak RSS |
-|--------------|-----------|-------------|----------|
-| jp_alloc     | 16.75 Mops/s | 768 ns    | 3.7 MB   |
-| mimalloc     | 14.56 Mops/s | 768 ns    | 5.9 MB   |
-| jemalloc     | 11.95 Mops/s | 768 ns    | 9.0 MB   |
-| tcmalloc     | 11.14 Mops/s | 1536 ns   | 9.7 MB   |
-| glibc malloc | 10.10 Mops/s | 1536 ns   | 2.8 MB   |
+| Allocator    | Throughput | Peak RSS |
+|--------------|-----------|----------|
+| jp_alloc     | 19.48 Mops/s | 4.0 MB  |
+| mimalloc     | 16.44 Mops/s | 6.0 MB  |
+| jemalloc     | 15.16 Mops/s | 10.7 MB |
+| tcmalloc     | 9.99 Mops/s  | 11.4 MB |
+| glibc malloc | 7.99 Mops/s  | 2.9 MB  |
 
 ### 64 threads
 
-| Allocator    | Throughput | p99 latency | Peak RSS |
-|--------------|-----------|-------------|----------|
-| jp_alloc     | 24.93 Mops/s | 768 ns    | 13 MB    |
-| tcmalloc     | 24.91 Mops/s | 768 ns    | 31 MB    |
-| mimalloc     | 22.19 Mops/s | 768 ns    | 28 MB    |
-| jemalloc     | 20.51 Mops/s | 768 ns    | 21 MB    |
-| glibc malloc | 13.13 Mops/s | 768 ns    | 11 MB    |
+| Allocator    | Throughput | Peak RSS |
+|--------------|-----------|----------|
+| jp_alloc     | 22.67 Mops/s | 19.5 MB |
+| mimalloc     | 18.86 Mops/s | 35.9 MB |
+| jemalloc     | 17.38 Mops/s | 50.1 MB |
+| tcmalloc     | 12.72 Mops/s | 45.1 MB |
+| glibc malloc | 9.28 Mops/s  | 12.9 MB |
 
 ### 300 threads
 
-| Allocator    | Throughput | p99 latency | Peak RSS |
-|--------------|-----------|-------------|----------|
-| jp_alloc     | 24.90 Mops/s | 384 ns     | 36 MB    |
-| mimalloc     | 25.31 Mops/s | 768 ns     | 88 MB    |
-| jemalloc     | 21.41 Mops/s | 768 ns     | 46 MB    |
-| tcmalloc     | 17.22 Mops/s | 196 µs     | 145 MB   |
-| glibc malloc | 12.28 Mops/s | 1536 ns    | 23 MB    |
+| Allocator    | Throughput | Peak RSS |
+|--------------|-----------|----------|
+| jp_alloc     | 31.32 Mops/s | 87 MB    |
+| mimalloc     | 19.44 Mops/s | 161 MB   |
+| jemalloc     | 17.83 Mops/s | 156 MB   |
+| tcmalloc     | 9.82 Mops/s  | 178 MB   |
+| glibc malloc | 8.76 Mops/s  | 26 MB    |
 
-**Throughput**: jp_alloc beats glibc by 103% and jemalloc by 16% at 300
-threads. At 8 threads jp_alloc is the fastest of all allocators (16.75
-Mops/s). Only mimalloc edges jp_alloc at 300 threads (by 2%).
+**Throughput**: jp_alloc is the fastest allocator at steady state — 61%
+faster than mimalloc, 76% faster than jemalloc, 3.6× faster than glibc
+at 300 threads. At 8 threads jp_alloc is also the fastest (19.48 Mops/s).
 
-**p99 latency**: jp_alloc has the lowest p99 of all tested allocators
-at 300 threads (384 ns — 2× better than jemalloc/mimalloc, 500× better
-than tcmalloc which spikes to 196 µs under heavy contention).
+**RSS**: jp_alloc uses the least physical memory among the fast allocators
+at every thread count. At 300 threads: 87 MB vs mimalloc 161 MB
+(1.8× less), jemalloc 156 MB (1.8× less), tcmalloc 178 MB (2× less).
+Only glibc is lighter (26 MB) but glibc is 3.6× slower.
 
-**RSS**: jp_alloc uses the least physical memory among the fast
-allocators at every thread count. At 300 threads: 36 MB vs mimalloc 88 MB
-(2.4× less), jemalloc 46 MB (1.3× less), tcmalloc 145 MB (4× less).
-Only glibc is lighter (23 MB) but glibc is 2× slower.
+**RSS** = peak resident set size (physical memory used) at steady state.
+Measurements use 10-second timed runs to capture steady-state behavior.
+Shorter runs (sub-second) underestimate RSS for all allocators because
+pool pages are not yet fully committed by demand paging.
 
-**p99 latency** = 99th-percentile per-operation latency. Lower is better.
-
-**RSS** = peak resident set size (physical memory used). Only pages
-actually touched by buddy-split headers count toward RSS — untouched
-pages in the 8MB pool reserve cost zero physical memory under demand
-paging.
+The global freelist uses **magazines** (arrays of 16 block pointers)
+transferred via memcpy, not linked lists walked via dependent loads.
+Refill pops one magazine + memcpy 16 pointers to the TLS cache. Flush
+memcpys 16 pointers from the cache into a magazine + one CAS push.
+Magazines are allocated from the pool system and recycled via a CAS-based
+free-list — no static arrays, no mmap for magazines.
 
 ## Usage
 
@@ -227,7 +249,9 @@ Compile-time flags (all optional):
 |------|---------|-------------|
 | `JP_ALLOC_DEBUG` | off | Enable ABA/double-free/corruption self-checks |
 | `JP_CACHE_N` | 32 | Per-thread cache slots per size class |
-| `JP_REFILL` | 16 | Blocks per global free list refill CAS |
+| `JP_MAG_SIZE` | 16 | Block pointers per magazine (flush/refill batch size) |
+| `JP_ALLOC_POOL_COUNT` | 24 | Power-of-2 pool classes (1B..8M) |
+| `JP_CACHELINE` | 64 | Cache-line size for alignment padding |
 | `JP_ALLOC_POOL_COUNT` | 24 | Power-of-2 pool classes (1B..8M) |
 | `JP_CACHELINE` | 64 | Cache-line size for alignment padding |
 

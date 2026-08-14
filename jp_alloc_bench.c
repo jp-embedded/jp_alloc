@@ -1,22 +1,20 @@
 /* jp_alloc_bench - thread-stress benchmark and correctness test for jp_alloc
  *
  * Build as a standalone binary:
- *   cc -O2 -DJP_ALLOC_IMPLEMENTATION -DJP_ALLOC_BENCH \
- *      jp_alloc.c jp_alloc_bench.c \
- *      -o jpbench -lpthread -lrt -lm
+ *   cc -O2 -DJP_ALLOC_COMPILED -DJP_ALLOC_BENCH \
+ *      src/jp_alloc/jp_alloc.c src/jp_alloc/jp_alloc_bench.c \
+ *      -o jpbench -lpthread -lrt
  *
- * Links jp_alloc.c so malloc/free are overridden globally. 300 pthreads each
- * run a fixed number of alloc/free operations that mimic a realistic
- * parse-graph workload (mixed small-object alloc/free + large malloc churn),
- * then the program prints ops/sec, per-thread p50/p99 latency, and peak RSS.
+ * The bench links jp_alloc.c so malloc/free are overridden globally; the
+ * "unsized" malloc/free churn exercises the header'd pool path, while the
+ * direct malloc/jp_free_sized calls exercise the headerless sized
+ * path. 300 pthreads each run a fixed number of operations that mimic tup's
+ * parse-graph workload, then the program prints ops/sec, per-thread p50/p99
+ * latency, and peak RSS.
  *
  * When built with -DJP_ALLOC_DEBUG the same binary exercises the in-allocator
- * ABA / double-free / corruption self-checks; abort() is the failure signal.
- *
- * To compare against other allocators (glibc, jemalloc, tcmalloc, mimalloc),
- * build without jp_alloc.c and use LD_PRELOAD:
- *   cc -O2 -DJP_ALLOC_BENCH jp_alloc_bench.c -o jpbench_stock -lpthread -lrt -lm
- *   LD_PRELOAD=/usr/lib/.../libjemalloc.so ./jpbench_stock
+ * ABA / double-free / wrong-API / size-mismatch self checks; abort() is the
+ * failure signal.
  *
  * Environment variables:
  *   JPBENCH_THREADS   (default 300)   number of worker threads
@@ -25,10 +23,8 @@
  *   JPBENCH_SECONDS   (optional)     if set, run for N seconds instead of
  *                                    a fixed op count (each thread checks
  *                                    the deadline between ops)
- *   JPBENCH_MODE      balanced (default) or alloc-heavy
  */
 
-/* _POSIX_C_SOURCE for clock_gettime / CLOCK_MONOTONIC / getrusage */
 #ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #endif
@@ -58,28 +54,35 @@
 #endif
 
 /* Workload mode env JPBENCH_MODE:
- *   balanced    (default): alloc/free together (LIFO pattern)
+ *   balanced    (default): graph_burn allocs+frees together (current)
  *   alloc-heavy: accumulate N_OUTSTANDING allocations before freeing any.
- *                Drains caches, exercises EBR refill from global freelist. */
+ *                Drains caches, exercises EBR refill from global freelist
+ *                and exposes hit-rate as a function of N.
+ *   free-heavy:  not implemented in this round; reserved for future. */
 static int g_mode_alloc_heavy = 0;
 
-/* ---- Allocation sizes ----
+/* ---- Sizes mimicking tup's hot structures ----
  *
- * Mixed sizes exercising distinct pool classes (small objects + large
- * malloc churn). Each "graph op" allocates a mix of small blocks, writes
- * to them (simulating struct initialization), then frees them. */
-#define SZ_NODE      80    /* small object  ~80B   */
-#define SZ_EDGE      48    /* small object  ~48B   */
-#define SZ_TENT     256    /* medium object ~256B  */
-#define SZ_FILE     128    /* medium object ~128B  */
+ * Derived from src/tup/{graph,entry,file,tent_tree,tent_list,tupid_list,
+ * pel_group}.c/h. These are the dominant sized-alloc callers. We round
+ * to the sizes that hit distinct jp_alloc pool classes so the cache is
+ * exercised across many slots. */
+#define SZ_NODE      80    /* struct node        ~80B   */
+#define SZ_EDGE      48    /* struct edge        ~48B   */
+#define SZ_TENT     256    /* struct tup_entry  ~256B   */
+#define SZ_FILE     128    /* struct file_entry ~128B   */
+#define SZ_TTREE     48    /* struct tupid_tree  ~48B   */
+#define SZ_TLIST     32    /* struct tupid_list  ~32B   */
+#define SZ_TENTLIST  48    /* struct tent_list   ~48B   */
+#define SZ_PEL       40    /* struct path_element ~40B  */
 
-/* Large malloc/free churn (1KB–32KB, mimicking internal buffers). */
+/* Unsized (malloc/free) churn mimicking SQLite/Lua/PCRE internal buffers. */
 #define MALLOC_MIN  1024
 #define MALLOC_MAX  32768
 
 /* Each "graph op" allocates one tent, a few nodes, several edges,
  * monkey-patches a file_entry, and tears it all down. This models the
- * alloc/free rhythm of a build-graph construction workload.
+ * alloc/free rhythm of tup's build-graph construction during `tup parse`.
  */
 #define OPS_PER_BURST     16
 #define NODES_PER_OP      4
@@ -154,8 +157,8 @@ static void graph_burn(struct thread_state *t, uint64_t *rng)
 		edges[i] = (struct link *)malloc(SZ_EDGE);
 
 	/* Touch the first byte of each block to force its first cache line
-	 * into L1, simulating the caller's first field write that a real
-	 * does immediately after allocation (e.g. initializing struct fields).
+	 * into L1, simulating the caller's first field write that real tup
+	 * does immediately after allocation (tent->dt, node->tnode.tupid, etc).
 	 * This isolates the test to pool-class inflation: both sized and
 	 * unsized paths now touch the same first cache line, so the only
 	 * remaining difference is block size (256 vs 512 for tent etc.). */
@@ -171,7 +174,7 @@ static void graph_burn(struct thread_state *t, uint64_t *rng)
 		edges[i]->next = nodes[i % NODES_PER_OP];
 	if(tent) tent->next = nodes[0];
 
-	/* tear down — interleave alloc/free in the order a real workload would */
+	/* tear down — interleave alloc/free like tup actually does */
 	free(tent);
 	free(file);
 	for(int i = 0; i < EDGES_PER_OP; i++)
@@ -344,7 +347,7 @@ int main(int argc, char **argv)
 		g_seed = (uint64_t)strtoull(e, NULL, 0);
 	if((e = getenv("JPBENCH_MODE")) != NULL) {
 		if(strcmp(e, "alloc-heavy") == 0) g_mode_alloc_heavy = 1;
-		/* "balanced" or any other value: balanced (default) */
+		/* "balanced" or any other value: graph_burn (default) */
 	}
 	if((e = getenv("JPBENCH_SECONDS")) != NULL && *e) {
 		g_run_timed = 1;
@@ -479,6 +482,17 @@ int main(int argc, char **argv)
 	printf("peak RSS        : %zu kB\n", peak_rss_kb());
 
 #ifdef JP_ALLOC_DEBUG
+	/* Cache hit/miss counters for comparing allocator designs. */
+	{
+		extern void jp_alloc_diag(size_t *, size_t *);
+		size_t hits = 0, misses = 0;
+		jp_alloc_diag(&hits, &misses);
+		if(hits + misses > 0) {
+			double rate = 100.0 * (double)hits / (double)(hits + misses);
+			printf("cache hit rate  : %.1f%%  (hits=%zu  misses=%zu)\n",
+				rate, hits, misses);
+		}
+	}
 	/* When run under JP_ALLOC_DEBUG the allocator aborts on the first ABA
 	 * / double-free / corruption event. Reaching here means none fired. */
 	printf("ABA self-check  : no ABA / corruption detected\n");
