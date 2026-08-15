@@ -23,6 +23,7 @@
  *   JPBENCH_SECONDS   (optional)     if set, run for N seconds instead of
  *                                    a fixed op count (each thread checks
  *                                    the deadline between ops)
+ *   JPBENCH_MODE      balanced (default) or alloc-heavy
  */
 
 #ifndef _POSIX_C_SOURCE

@@ -280,8 +280,7 @@ Compile-time flags (all optional):
 | `JP_MAG_SIZE` | 16 | Block pointers per magazine (flush/refill batch size) |
 | `JP_ALLOC_POOL_COUNT` | 24 | Power-of-2 pool classes (1B..8M) |
 | `JP_CACHELINE` | 64 | Cache-line size for alignment padding |
-| `JP_ALLOC_POOL_COUNT` | 24 | Power-of-2 pool classes (1B..8M) |
-| `JP_CACHELINE` | 64 | Cache-line size for alignment padding |
+| `JP_MADVISE_PID` | 12 | Min pool id for madvise (4KB blocks; returns freed pages to OS) |
 
 ## Platform support
 
