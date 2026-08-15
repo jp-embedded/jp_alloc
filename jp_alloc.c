@@ -1,7 +1,7 @@
 /* jp_alloc - lock-free memory allocator
  *
  * https://github.com/jp-embedded/jp_alloc
- * GPL-2.0-or-later
+ * GPL-3.0-or-later
  *
  * A lock-free, EBR-protected, thread-caching memory allocator written in
  * pure C11. Features:
