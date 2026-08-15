@@ -61,6 +61,34 @@ Memory is organized into power-of-2 size classes (1, 2, 4, ..., 8388608 bytes).
 When a pool is empty, a block from the next-larger pool is split in half —
 one half is returned to the caller, the other goes into the empty pool.
 
+### Fragmentation
+
+The power-of-2 size-class design eliminates **external fragmentation**:
+every free block in a pool is exactly the same size, so any allocation
+request that maps to pool N can be satisfied by any free block in that
+pool — no best-fit scanning, no "holes" that are too small for the
+next request. A freed 128B block can serve any future `malloc(65..128)`,
+and a freed 256B block can serve any future `malloc(129..256)`.
+
+The trade-off is **internal fragmentation** (waste within a block): a
+65-byte allocation gets a 128-byte block, wasting 63 bytes (49%). However,
+this waste is **bounded and predictable** — the worst case is always 50%
+per allocation. Fine-grained size classes (e.g., jemalloc's 48, 64, 80,
+96, 112, 128) reduce internal waste but introduce external fragmentation:
+a freed 48-byte block can't serve a 64-byte request, so the 48-byte pool
+accumulates free blocks while the 64-byte pool is starved. Power-of-2
+pools trade higher per-block waste for zero external fragmentation and
+O(1) allocation — no scanning, no searching, just pop from the pool.
+
+Buddy splitting further reduces fragmentation by allowing larger blocks
+to be split for smaller needs on demand. When a pool is empty, the next
+larger pool donates a block — no separate per-size slabs are held idle.
+Magazines recycle blocks within their size class, keeping the flow
+efficient without needing coalescing (merging freed buddies back into
+larger blocks). The 8MB pool reserve is demand-paged, so uncoalesced
+small blocks sitting in magazine lists cost only the pages they touch —
+the rest of the reserve stays uncommitted.
+
 ### Magazines
 
 The global freelist for each pool is a linked list of **magazines** —
