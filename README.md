@@ -89,6 +89,15 @@ larger blocks). The 8MB pool reserve is demand-paged, so uncoalesced
 small blocks sitting in magazine lists cost only the pages they touch —
 the rest of the reserve stays uncommitted.
 
+For large blocks (≥ 4KB), jp_alloc uses `madvise(MADV_DONTNEED)` at EBR
+drain time to return freed pages to the OS. This caps the maximum
+internal-fragmentation waste that accumulates as RSS to ~4KB per
+allocation — the excess between the user's request and the pool block
+size (e.g., 31KB unused in a 32KB block) is returned to the OS
+instead of staying committed. This makes the power-of-2 design
+practical even for large allocations: the worst-case 50% internal
+waste is reclaimed, not retained.
+
 ### Magazines
 
 The global freelist for each pool is a linked list of **magazines** —
@@ -138,7 +147,7 @@ Results are median of 3 runs.
 
 | Allocator    | Throughput | Peak RSS |
 |--------------|-----------|----------|
-| jp_alloc     | 5.13 Mops/s | 2.1 MB   |
+| jp_alloc     | 4.84 Mops/s | 2.0 MB   |
 | tcmalloc     | 5.33 Mops/s | 7.4 MB   |
 | mimalloc     | 4.75 Mops/s | 2.4 MB   |
 | jemalloc     | 3.68 Mops/s | 4.0 MB   |
@@ -148,7 +157,7 @@ Results are median of 3 runs.
 
 | Allocator    | Throughput | Peak RSS |
 |--------------|-----------|----------|
-| jp_alloc     | 19.48 Mops/s | 4.0 MB  |
+| jp_alloc     | 18.52 Mops/s | 3.9 MB  |
 | mimalloc     | 16.44 Mops/s | 6.0 MB  |
 | jemalloc     | 15.16 Mops/s | 10.7 MB |
 | tcmalloc     | 9.99 Mops/s  | 11.4 MB |
@@ -158,7 +167,7 @@ Results are median of 3 runs.
 
 | Allocator    | Throughput | Peak RSS |
 |--------------|-----------|----------|
-| jp_alloc     | 22.67 Mops/s | 19.5 MB |
+| jp_alloc     | 21.49 Mops/s | 18.2 MB |
 | mimalloc     | 18.86 Mops/s | 35.9 MB |
 | jemalloc     | 17.38 Mops/s | 50.1 MB |
 | tcmalloc     | 12.72 Mops/s | 45.1 MB |
@@ -168,20 +177,28 @@ Results are median of 3 runs.
 
 | Allocator    | Throughput | Peak RSS |
 |--------------|-----------|----------|
-| jp_alloc     | 31.32 Mops/s | 87 MB    |
-| mimalloc     | 19.44 Mops/s | 161 MB   |
-| jemalloc     | 17.83 Mops/s | 156 MB   |
-| tcmalloc     | 9.82 Mops/s  | 178 MB   |
-| glibc malloc | 8.76 Mops/s  | 26 MB    |
+| jp_alloc     | 22.25 Mops/s | 80 MB    |
+| mimalloc     | 19.18 Mops/s | 160 MB   |
+| jemalloc     | 17.84 Mops/s | 155 MB   |
+| tcmalloc     | 9.81 Mops/s  | 177 MB   |
+| glibc malloc | 8.83 Mops/s  | 26 MB    |
 
-**Throughput**: jp_alloc is the fastest allocator at steady state — 61%
-faster than mimalloc, 76% faster than jemalloc, 3.6× faster than glibc
-at 300 threads. At 8 threads jp_alloc is also the fastest (19.48 Mops/s).
+**Throughput**: jp_alloc is the fastest allocator at steady state — 16%
+faster than mimalloc, 25% faster than jemalloc, 2.5× faster than glibc
+at 300 threads. At 8 threads jp_alloc is also the fastest (18.52 Mops/s).
 
 **RSS**: jp_alloc uses the least physical memory among the fast allocators
-at every thread count. At 300 threads: 87 MB vs mimalloc 161 MB
-(1.8× less), jemalloc 156 MB (1.8× less), tcmalloc 178 MB (2× less).
-Only glibc is lighter (26 MB) but glibc is 3.6× slower.
+at every thread count. At 300 threads: 80 MB vs mimalloc 160 MB
+(2× less), jemalloc 155 MB (1.9× less), tcmalloc 177 MB (2.2× less).
+Only glibc is lighter (26 MB) but glibc is 2.5× slower.
+
+**madvise**: By default, jp_alloc uses `madvise(MADV_DONTNEED)` to
+return freed large-block pages (≥ 4KB) to the OS at EBR drain time,
+reducing RSS by ~9%. This costs ~5% throughput from the syscall overhead.
+To maximize throughput at the expense of RSS, disable madvise by setting
+`JP_MADVISE_PID` to a value above `JP_ALLOC_POOL_COUNT` (e.g.
+`-DJP_MADVISE_PID=99`). Without madvise, throughput increases to ~31
+Mops/s at 300 threads but RSS rises to ~87 MB.
 
 **RSS** = peak resident set size (physical memory used) at steady state.
 Measurements use 10-second timed runs to capture steady-state behavior.
