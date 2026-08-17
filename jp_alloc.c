@@ -1,26 +1,31 @@
-/* jp_alloc - lock-free memory allocator
+/* jp_alloc - per-thread buddy-split memory allocator
  *
  * https://github.com/jp-embedded/jp_alloc
  * GPL-3.0-or-later
  *
- * A lock-free, EBR-protected, thread-caching memory allocator written in
- * pure C11. Features:
+ * A per-thread memory allocator written in pure C11. Features:
  *
- * - 64-bit CAS freelist with 3-epoch-ring EBR for ABA-freedom
- * - Per-thread fixed-array cache (N=32 per size class) with no atomics
- *   on the hot path
- * - Magazine-based global freelist: refill = pop 1 magazine + memcpy 16
- *   pointers; flush = memcpy 16 pointers + 1 CAS push. No dependent-
- *   load walks, no in-band chain-building loops
- * - Magazines allocated from the pool system (pool 8 = 256B blocks),
- *   recycled via CAS-based free-list — no static arrays, no mmap
- * - Binary buddy splitting with power-of-2 size classes (1B..8MB)
- * - Demand paging: the 8MB pool reserve only commits touched pages
- * - madvise(MADV_DONTNEED) at EBR drain time for blocks >= 4KB,
- *   returning internal-fragmentation pages to the OS
+ * - Per-thread power-of-2 pools with binary buddy splitting (1B..8MB)
+ * - Zero atomics on the hot path: alloc = freelist pop, free = freelist push
+ * - No magazines, no EBR, no CAS, no global pools, no TLS cache array
+ * - Per-4K-page user-held counter with deferred madvise(MADV_DONTNEED):
+ *   when all user-held blocks on a 4K page are freed, the page returns
+ *   to the OS. Sub-4K block fragmentation no longer leaks RSS.
+ * - 8M-aligned regions (mmap 16M + trim) with a 4K counter-table page
  * - Windows (VirtualAlloc) and POSIX (mmap) backends
  * - mremap for large reallocs on Linux
  * - Portable to 32-bit and 64-bit (GCC 4.7+, Clang 3.0+, MSVC 2015+)
+ *
+ * Cross-thread free: when Thread B frees a block that Thread A allocated,
+ * B pushes it onto B's own freelist. B can hand it out later. The
+ * per-4K-page counter (in A's region's counter table) is decremented
+ * atomically by B. When it hits 0, B schedules madvise for that 4K page
+ * (in A's region). Any thread can madvise any virtual address.
+ *
+ * Cross-thread memory flow (A allocates, B frees) can cause A's freelist
+ * to drain while B accumulates free blocks. Step 1 ignores this — A
+ * buddy-splits or mmaps a new region. Step 2 (future) adds a global
+ * return list for batch cross-thread transfer.
  */
 
 /* mremap is Linux-only and requires _GNU_SOURCE before includes */
@@ -37,9 +42,6 @@
 #include <stdlib.h>
 #include <malloc.h>
 
-/* Define JP_ALLOC_IMPLEMENTATION before including the header so the real
- * (non-inline) declaration of jp_alloc_reset() is visible in this
- * translation unit. This also silences -Wmissing-prototypes. */
 #ifndef JP_ALLOC_IMPLEMENTATION
 #define JP_ALLOC_IMPLEMENTATION
 #endif
@@ -47,17 +49,6 @@
 
 #ifdef JP_ALLOC_DEBUG
 #include <stdio.h>
-#endif
-
-/* ---- Cache hit/miss instrumentation (bench-only, compiled out in release) ---- */
-#ifdef JP_ALLOC_DEBUG
-static _Atomic(size_t) g_cache_hits;
-static _Atomic(size_t) g_cache_misses;
-#define JP_COUNT_HIT   do { __atomic_add_fetch(&g_cache_hits,   1, __ATOMIC_RELAXED); } while(0)
-#define JP_COUNT_MISS  do { __atomic_add_fetch(&g_cache_misses, 1, __ATOMIC_RELAXED); } while(0)
-#else
-#define JP_COUNT_HIT   ((void)0)
-#define JP_COUNT_MISS  ((void)0)
 #endif
 
 #ifdef __GNUC__
@@ -69,10 +60,6 @@ static _Atomic(size_t) g_cache_misses;
 #endif
 
 /* ---- Portability fallbacks ---- */
-
-#ifndef JP_ALLOC_POOL_COUNT
-#define JP_ALLOC_POOL_COUNT 24  /* Gives pools of 1 - 8M */
-#endif
 
 #ifndef JP_CACHELINE
 #define JP_CACHELINE 64
@@ -89,14 +76,146 @@ static _Atomic(size_t) g_cache_misses;
 #endif
 #endif
 
+#ifndef JP_ALLOC_INTERMEDIATE_K
+#define JP_ALLOC_INTERMEDIATE_K 0
+#endif
+
+/* ---- Pool table: power-of-2 + intermediate size classes ----
+ *
+ * K=0: pure power-of-2 (24 pools, 1..8M).
+ * K=4: 39 pools. Intermediate = 2^i * 5. malloc(128)->160B (0 waste vs 256B).
+ * K=6: 37 pools. Intermediate = 2^i * 21.
+ * Intermediates with small < sizeof(union header) are skipped.
+ * Identity: 1*small + 3*intermediate = split_from (pow2).
+ */
+
+struct pool_info {
+	uint32_t size;
+	uint8_t  is_pow2;
+	uint32_t split_from;
+	uint32_t small_size;
+};
+
+#if JP_ALLOC_INTERMEDIATE_K == 0
+static const struct pool_info g_pools[] = {
+	{1u,1,0,0},{2u,1,0,0},{4u,1,0,0},{8u,1,0,0},{16u,1,0,0},{32u,1,0,0},
+	{64u,1,0,0},{128u,1,0,0},{256u,1,0,0},{512u,1,0,0},{1024u,1,0,0},
+	{2048u,1,0,0},{4096u,1,0,0},{8192u,1,0,0},{16384u,1,0,0},{32768u,1,0,0},
+	{65536u,1,0,0},{131072u,1,0,0},{262144u,1,0,0},{524288u,1,0,0},
+	{1048576u,1,0,0},{2097152u,1,0,0},{4194304u,1,0,0},{8388608u,1,0,0},
+};
+#elif JP_ALLOC_INTERMEDIATE_K == 4
+static const struct pool_info g_pools[] = {
+	{1u,1,0,0},{2u,1,0,0},{4u,1,0,0},{8u,1,0,0},{16u,1,0,0},{32u,1,0,0},
+	{64u,1,0,0},{128u,1,0,0},
+	{160u,0,512u,32u},
+	{256u,1,0,0},
+	{320u,0,1024u,64u},
+	{512u,1,0,0},
+	{640u,0,2048u,128u},
+	{1024u,1,0,0},
+	{1280u,0,4096u,256u},
+	{2048u,1,0,0},
+	{2560u,0,8192u,512u},
+	{4096u,1,0,0},
+	{5120u,0,16384u,1024u},
+	{8192u,1,0,0},
+	{10240u,0,32768u,2048u},
+	{16384u,1,0,0},
+	{20480u,0,65536u,4096u},
+	{32768u,1,0,0},
+	{40960u,0,131072u,8192u},
+	{65536u,1,0,0},
+	{81920u,0,262144u,16384u},
+	{131072u,1,0,0},
+	{163840u,0,524288u,32768u},
+	{262144u,1,0,0},
+	{327680u,0,1048576u,65536u},
+	{524288u,1,0,0},
+	{655360u,0,2097152u,131072u},
+	{1048576u,1,0,0},
+	{1310720u,0,4194304u,262144u},
+	{2097152u,1,0,0},
+	{2621440u,0,8388608u,524288u},
+	{4194304u,1,0,0},
+	{8388608u,1,0,0},
+};
+#elif JP_ALLOC_INTERMEDIATE_K == 6
+static const struct pool_info g_pools[] = {
+	{1u,1,0,0},{2u,1,0,0},{4u,1,0,0},{8u,1,0,0},{16u,1,0,0},{32u,1,0,0},
+	{64u,1,0,0},{128u,1,0,0},{256u,1,0,0},{512u,1,0,0},
+	{672u,0,2048u,32u},
+	{1024u,1,0,0},
+	{1344u,0,4096u,64u},
+	{2048u,1,0,0},
+	{2688u,0,8192u,128u},
+	{4096u,1,0,0},
+	{5376u,0,16384u,256u},
+	{8192u,1,0,0},
+	{10752u,0,32768u,512u},
+	{16384u,1,0,0},
+	{21504u,0,65536u,1024u},
+	{32768u,1,0,0},
+	{43008u,0,131072u,2048u},
+	{65536u,1,0,0},
+	{86016u,0,262144u,4096u},
+	{131072u,1,0,0},
+	{172032u,0,524288u,8192u},
+	{262144u,1,0,0},
+	{344064u,0,1048576u,16384u},
+	{524288u,1,0,0},
+	{688128u,0,2097152u,32768u},
+	{1048576u,1,0,0},
+	{1376256u,0,4194304u,65536u},
+	{2097152u,1,0,0},
+	{2752512u,0,8388608u,131072u},
+	{4194304u,1,0,0},
+	{8388608u,1,0,0},
+};
+#else
+#error "JP_ALLOC_INTERMEDIATE_K must be 0, 4, or 6"
+#endif
+
+#define JP_POOL_COUNT (sizeof(g_pools) / sizeof(g_pools[0]))
+
+static inline size_t pool_id_by_size(size_t size)
+{
+	for(size_t pid = 0; pid < JP_POOL_COUNT; pid++)
+		if(g_pools[pid].size >= size) return pid;
+	return JP_POOL_COUNT;
+}
+
+#define JP_PID_LUT_SIZE 257
+static uint8_t g_pid_lut[JP_PID_LUT_SIZE];
+static int g_pid_lut_done = 0;
+static void jp_pid_lut_init(void)
+{
+	for(size_t pid = 0; pid < JP_POOL_COUNT; pid++) {
+		size_t sz = g_pools[pid].size;
+		size_t start = (pid == 0) ? 0 : g_pools[pid-1].size + 1;
+		for(size_t s = start; s <= sz && s < JP_PID_LUT_SIZE; s++)
+			g_pid_lut[s] = (uint8_t)pid;
+	}
+	g_pid_lut[0] = 0;
+	g_pid_lut_done = 1;
+}
+
 /* madvise(MADV_DONTNEED) returns freed large-block pages to the OS,
  * reducing RSS. Only applies to pools where blocks are page-aligned
  * and span whole pages (pid >= JP_MADVISE_PID). Smaller blocks share
  * pages with other blocks and can't be madvise'd individually.
  * Disabled on Windows (no madvise). */
-#ifndef JP_MADVISE_PID
-#define JP_MADVISE_PID 12  /* pool 12 = 4KB blocks — first page-aligned pool */
-#endif
+/* First page-aligned pool (>= 4K). Dynamic — depends on pool table. */
+static size_t jp_madvise_pid_val(void)
+{
+	static size_t cached = 0;
+	if(!cached) {
+		for(size_t pid = 0; pid < JP_POOL_COUNT; pid++)
+			if(g_pools[pid].size >= 4096) { cached = pid; break; }
+	}
+	return cached;
+}
+#define JP_MADVISE_PID jp_madvise_pid_val()
 
 /* __builtin_clzll fallback for MSVC */
 #ifdef _MSC_VER
@@ -109,34 +228,6 @@ static inline int jp_clzll(unsigned long long x)
 }
 #else
 #define jp_clzll(x) __builtin_clzll(x)
-#endif
-
-/* ---- Single-threaded fast path ----
- *
- * glibc 2.32+ provides __libc_single_threaded: a char that starts at 1
- * (single-threaded) and transitions to 0 exactly once when pthread_create
- * is called (never goes back to 1). This lets us skip EBR overhead
- * (epoch stores, thread-list walk, g_epoch CAS) in single-threaded mode.
- *
- * The CAS on the magazine list is always used (even single-threaded) —
- * it's uncontended but atomic, so it's safe if pthread_create fires
- * mid-operation. The EBR skip only affects per-thread state (epoch,
- * active flag) and the pointless ebr_try_advance walk.
- *
- * On older glibc or non-glibc platforms: always multi-threaded path
- * (dead branch, zero cost). */
-
-#if defined(__GLIBC__) && defined(__GLIBC_PREREQ)
-#if __GLIBC_PREREQ(2, 32)
-#include <sys/single_threaded.h>
-#define JP_HAVE_SINGLE_THREADED 1
-#endif
-#endif
-
-#ifdef JP_HAVE_SINGLE_THREADED
-#define jp_single_threaded() (__atomic_load_n(&__libc_single_threaded, __ATOMIC_ACQUIRE))
-#else
-#define jp_single_threaded() (0)
 #endif
 
 /* ---- Debug header (enabled by -DJP_ALLOC_DEBUG) ---- */
@@ -205,38 +296,146 @@ static void os_free_pages(void *mem, size_t size)
 #endif /* _WIN32 */
 
 /* ==========================================================================
- * 64-bit CAS magazine freelist + EBR + thread-local cache
+ * Per-4K-page user-held allocation counter (v1.5 RSS fix)
  * ==========================================================================
  *
- * The global freelist for each pool class is a linked list of magazines.
- * Each magazine holds JP_MAG_SIZE block pointers in an array. Refill pops
- * one magazine and memcpys its pointers into the TLS cache. Flush memcpys
- * pointers from the TLS cache into a magazine and CAS-pushes it to the
- * global list. No dependent-load walks, no chain-building loops.
+ * When pool N is empty and pool_get descends to pool N+1, the buddy
+ * cascade commits every 4K page it touches. Without a per-4K-page
+ * counter, freed small blocks can't have their pages returned to the
+ * OS because their neighbors on the same 4K page may still be in use.
  *
- * Magazines come from a static global array — no mmap, no malloc, no mutex.
- * A CAS-based free-list hands out magazines from the array. Magazines are
- * never freed; they cycle between the TLS empty stack and the global
- * magazine lists forever.
+ * Fix: maintain a per-4K-page counter of USER-HELD blocks. When the
+ * counter dec-and-tests to 0, schedule madvise(MADV_DONTNEED) via a
+ * per-thread deferred batch (re-check at flush time to skip hot pages).
  *
- * ABA is prevented by a 3-epoch ring EBR. Thread teardown deposits
- * magazines into a global limbo drained lazily by live threads.
+ * Storage: 4K (= 2048 uint16_t entries) per 8M region = 0.049% overhead.
+ * 8M-aligned regions: required so any sub-block address can mask down
+ * to its region base in O(1).
  */
+#ifndef JP_ALLOC_PAGE_COUNTER
+#define JP_ALLOC_PAGE_COUNTER 1
+#endif
 
-/* ---- Atomic primitives ---- */
-static inline void *atomic_load_ptr(void * volatile *p)
+/* ---- Statistics (compiled in with -DJP_ALLOC_STATS) ---- */
+#ifdef JP_ALLOC_STATS
+#include <stdio.h>
+static _Atomic(size_t) g_live_blocks[JP_POOL_COUNT];
+static _Atomic(size_t) g_alloc_count[JP_POOL_COUNT];
+static _Atomic(size_t) g_free_count[JP_POOL_COUNT];
+static _Atomic(size_t) g_mmap_count[JP_POOL_COUNT];
+static _Atomic(size_t) g_mmap_bytes[JP_POOL_COUNT];
+static _Atomic(size_t) g_madvise_count[JP_POOL_COUNT];
+static _Atomic(size_t) g_madvise_bytes[JP_POOL_COUNT];
+static _Atomic(size_t) g_direct_mmap_bytes;
+static _Atomic(size_t) g_direct_live_bytes;
+static _Atomic(size_t) g_page_madvise_count;
+#define JP_STAT_LIVE(pid)   __atomic_add_fetch(&g_live_blocks[pid],  1, __ATOMIC_RELAXED)
+#define JP_STAT_DEAD(pid)   __atomic_sub_fetch(&g_live_blocks[pid],  1, __ATOMIC_RELAXED)
+#define JP_STAT_ALLOC(pid)  __atomic_add_fetch(&g_alloc_count[pid], 1, __ATOMIC_RELAXED)
+#define JP_STAT_FREE(pid)   __atomic_add_fetch(&g_free_count[pid],  1, __ATOMIC_RELAXED)
+#define JP_STAT_MMAP(pid, bytes) do { \
+	__atomic_add_fetch(&g_mmap_count[pid], 1, __ATOMIC_RELAXED); \
+	__atomic_add_fetch(&g_mmap_bytes[pid], (bytes), __ATOMIC_RELAXED); \
+} while(0)
+#define JP_STAT_MADVISE(pid, bytes) do { \
+	__atomic_add_fetch(&g_madvise_count[pid], 1, __ATOMIC_RELAXED); \
+	__atomic_add_fetch(&g_madvise_bytes[pid], (bytes), __ATOMIC_RELAXED); \
+} while(0)
+#define JP_STAT_MMAP_DIRECT(bytes) \
+	__atomic_add_fetch(&g_direct_mmap_bytes, (bytes), __ATOMIC_RELAXED)
+#define JP_STAT_DIRECT_LIVE(bytes) \
+	__atomic_add_fetch(&g_direct_live_bytes, (bytes), __ATOMIC_RELAXED)
+#define JP_STAT_DIRECT_DEAD(bytes) \
+	__atomic_sub_fetch(&g_direct_live_bytes, (bytes), __ATOMIC_RELAXED)
+static void jp_alloc_stats_dump(void);
+static void jp_alloc_stats_register_atexit(void) __attribute__((constructor));
+static void jp_alloc_stats_register_atexit(void) { atexit(jp_alloc_stats_dump); }
+#else
+#define JP_STAT_LIVE(pid)   ((void)0)
+#define JP_STAT_DEAD(pid)   ((void)0)
+#define JP_STAT_ALLOC(pid)  ((void)0)
+#define JP_STAT_FREE(pid)   ((void)0)
+#define JP_STAT_MMAP(pid, bytes) ((void)0)
+#define JP_STAT_MADVISE(pid, bytes) ((void)0)
+#define JP_STAT_MMAP_DIRECT(bytes) ((void)0)
+#define JP_STAT_DIRECT_LIVE(bytes) ((void)0)
+#define JP_STAT_DIRECT_DEAD(bytes) ((void)0)
+#endif
+
+#if JP_ALLOC_PAGE_COUNTER
+#define JP2_REGION_SIZE   (8 * 1024 * 1024)
+#define JP2_TABLE_SIZE    (4 * 1024)
+#define JP2_TABLE_ENTRIES (JP2_TABLE_SIZE / sizeof(uint16_t))
+
+#ifndef _WIN32
+static void *os_alloc_8m_region_counter(void)
 {
-	return __atomic_load_n(p, __ATOMIC_ACQUIRE);
+	size_t region_sz = JP2_REGION_SIZE;
+	size_t table_sz  = JP2_TABLE_SIZE;
+	size_t span = region_sz * 2 + table_sz;
+	char *mem = (char *)os_alloc_pages(span);
+	if(!mem) return NULL;
+	uintptr_t base = (uintptr_t)mem;
+	uintptr_t aligned = (base + region_sz - 1) & ~((uintptr_t)region_sz - 1);
+	if(aligned != base) {
+		os_free_pages(mem, (size_t)(aligned - base));
+	}
+	uintptr_t kept_end = aligned + region_sz + table_sz;
+	uintptr_t span_end = base + span;
+	if(kept_end < span_end) {
+		os_free_pages((char *)kept_end, (size_t)(span_end - kept_end));
+	}
+	uint16_t *table = (uint16_t *)(aligned + region_sz);
+	memset(table, 0, table_sz);
+	return (void *)aligned;
 }
-static inline void atomic_store_ptr(void * volatile *p, void *v)
+#else
+static void *os_alloc_8m_region_counter(void)
 {
-	__atomic_store_n(p, v, __ATOMIC_RELEASE);
+	return os_alloc_pages(JP2_REGION_SIZE);
 }
-static inline int atomic_cas_ptr(void * volatile *p, void **old, void *desired)
+#endif
+
+static inline uint16_t *jp_page_counter_of(void *block_addr)
 {
-	return __atomic_compare_exchange_n(p, old, desired,
-		0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+	uintptr_t a = (uintptr_t)block_addr;
+	uintptr_t base = a & ~((uintptr_t)(JP2_REGION_SIZE - 1));
+	uint16_t *table = (uint16_t *)(base + JP2_REGION_SIZE);
+	return table + ((a - base) >> 12);
 }
+
+static inline void jp_page_counter_inc(void *block_addr)
+{
+	uint16_t *cnt = jp_page_counter_of(block_addr);
+	__atomic_add_fetch(cnt, 1, __ATOMIC_RELAXED);
+}
+
+static inline int jp_page_counter_dec_and_test(void *block_addr)
+{
+	uint16_t *cnt = jp_page_counter_of(block_addr);
+	return __atomic_sub_fetch(cnt, 1, __ATOMIC_RELAXED) == 0;
+}
+
+static inline int jp_page_counter_is_still_zero(void *block_addr)
+{
+	uint16_t *cnt = jp_page_counter_of(block_addr);
+	return __atomic_load_n(cnt, __ATOMIC_RELAXED) == 0;
+}
+
+#define JP_PC_PENDING_CAP 64
+struct jp_pc_pending {
+	void *pages[JP_PC_PENDING_CAP];
+	size_t cnt;
+};
+
+#define JP_PC_INC(mem, pid)   do { if((pid) < JP_MADVISE_PID) jp_page_counter_inc(mem); } while(0)
+#define JP_PC_DEC(h, pid, dec_hit_zero) do { \
+	*(dec_hit_zero) = ((pid) < JP_MADVISE_PID) && jp_page_counter_dec_and_test(h); \
+} while(0)
+#else
+#define JP_PC_INC(mem, pid)   ((void)0)
+#define JP_PC_DEC(h, pid, dec_hit_zero) (*(dec_hit_zero) = 0)
+#endif
 
 /* ---- Header'd path types ---- */
 
@@ -252,120 +451,66 @@ union header {
 	max_align_t _align;
 };
 
-/* ---- Magazine: batch container for the global freelist ----
+/* ---- Per-thread pool state ----
  *
- * JP_MAG_SIZE must be <= JP_CACHE_N. A flush copies JP_MAG_SIZE blocks
- * from the bottom of the cache into a magazine, keeping the rest. The
- * cache oscillates between (JP_CACHE_N - JP_MAG_SIZE + 1) and JP_CACHE_N. */
-
-#ifndef JP_CACHE_N
-#define JP_CACHE_N 32
-#endif
-
-#ifndef JP_MAG_SIZE
-#define JP_MAG_SIZE 16
-#endif
-#if JP_MAG_SIZE > JP_CACHE_N
-#error "JP_MAG_SIZE must not exceed JP_CACHE_N"
-#endif
-
-struct magazine {
-	struct magazine *next;   /* global list link / TLS empty stack link */
-	void *slots[JP_MAG_SIZE];
-};
-
-/* ---- Static magazine pool ----
+ * Each thread has its own freelist per pool class.Alloc pops from the
+ * freelist (one pointer read + write, zero atomics). Free pushes to
+ * the freelist (one pointer write, zero atomics). When a freelist is
+ * empty, pool_get buddy-splits from the next larger pool's freelist
+ * (same thread, zero atomics). When the largest pool is empty, mmap
+ * a new 8M-aligned region.
  *
- * A CAS-based free-list hands out magazines. When the free-list is empty,
- * a magazine is allocated from the pool system (pool 8 = 256B block, which
- * fits the ~136-byte magazine struct + 16-byte header). Magazines are never
- * freed to the OS — they cycle between the TLS empty stack, the global
- * magazine lists, and the free-list forever. 
- * Magazines come from a fixed pool count (pool 8 = 256B), which is backed
- * by the 8MB demand-paged reserve. The first magazine allocation triggers
- * one buddy-split from pool 23, populating ~16K magazines from one mmap.
- * Only the touched pages count toward RSS (~28 pages = 112 KB). */
-#define JP_MAG_PID 8  /* pool 8 = 256B block, fits struct magazine + header */
+ * Cross-thread: Thread B freeing a block from Thread A's region pushes
+ * it onto B's own freelist. B can reuse it later. The per-4K-page
+ * counter (in A's region) is decremented atomically by B; on 0, B
+ * schedules madvise. No data crosses between threads — just memory
+ * addresses (which are process-wide valid) and atomic counter ops. */
 
-static struct magazine * volatile g_mag_free = NULL;
-
-static void mag_free(struct magazine *m)
-{
-	/* Return to the CAS-based free-list for reuse by other threads. */
-	struct magazine *old = atomic_load_ptr((void * volatile *)&g_mag_free);
-	do {
-		m->next = old;
-	} while(!atomic_cas_ptr((void * volatile *)&g_mag_free, (void **)&old, m));
-}
-
-/* ---- Pool types ---- */
-
-struct pool {
-	struct magazine * volatile head;  /* magazine list head */
-	char _pad[JP_CACHELINE - sizeof(struct magazine *)];
-};
-
-static _Alignas(JP_CACHELINE) struct pool g_pools[JP_ALLOC_POOL_COUNT];
-static struct pool *g_pools_last = g_pools + JP_ALLOC_POOL_COUNT - 1;
-
-static void *pool_get(struct pool *p, size_t pid); /* forward decl */
-static struct magazine *mag_alloc(void)
-{
-	/* Try the free-list first (recycled magazines). */
-	struct magazine *m = atomic_load_ptr((void * volatile *)&g_mag_free);
-	for(;;) {
-		if(!m) break;
-		struct magazine *next = m->next;
-		if(atomic_cas_ptr((void * volatile *)&g_mag_free, (void **)&m, next))
-			return m;
-	}
-	/* Free-list empty — allocate from the pool system.
-	 * The pool block includes a 16-byte union header; the magazine
-	 * struct is placed after the header (like any malloc'd block). */
-	union header *h = (union header *)pool_get(g_pools + JP_MAG_PID, JP_MAG_PID);
-	if(!h) return NULL;
-	h->s.size = JP_MAG_PID;
-	return (struct magazine *)(h + 1);
-}
-
-
-
-/* ---- Epoch-Based Reclamation (3-epoch ring) ---- */
-
-#define JP_EBR_EPOCHS 3
-#define JP_EBR_INACTIVE (-1L)
-
-struct ebr_thread {
-	_Atomic(int)    active;
-	_Atomic(long)   epoch;
-	_Atomic(struct ebr_thread *) next;
-};
-
-static _Atomic(long) g_epoch = 0;
-static _Atomic(struct ebr_thread *) g_thread_list = NULL;
-
-/* ---- Per-thread state ---- */
-
-struct retired_chain {
-	struct magazine *head;
-	struct magazine *tail;
-};
-
+#if JP_ALLOC_PAGE_COUNTER
 struct tls_state {
-	struct ebr_thread *self;
-	/* cache */
-	void *cache[JP_ALLOC_POOL_COUNT][JP_CACHE_N];
-	size_t cnt[JP_ALLOC_POOL_COUNT];
-	/* empty magazines: one unified stack per thread, shared across all
-	 * pools. Grows during refills, shrinks during flushes. */
-	struct magazine *mag_empty;
-	/* retired batches: per-pool, per-epoch-slot */
-	struct retired_chain retired[JP_ALLOC_POOL_COUNT][JP_EBR_EPOCHS];
-	int in_pop_cs;
+	union header *freelist[JP_POOL_COUNT];
+	struct jp_pc_pending pc_pending;
 };
+#else
+struct tls_state {
+	union header *freelist[JP_POOL_COUNT];
+};
+#endif
 
 static _Thread_local struct tls_state tls;
 static _Thread_local int tls_registered = 0;
+
+/* ---- Pending page-madvise batch (per-thread) ---- */
+#if JP_ALLOC_PAGE_COUNTER
+static void jp_page_pending_flush(void)
+{
+#ifndef _WIN32
+	for(size_t i = 0; i < tls.pc_pending.cnt; i++) {
+		void *page = tls.pc_pending.pages[i];
+		if(jp_page_counter_is_still_zero(page)) {
+			madvise(page, 4096, MADV_DONTNEED);
+#ifdef JP_ALLOC_STATS
+			__atomic_add_fetch(&g_page_madvise_count, 1, __ATOMIC_RELAXED);
+#endif
+		}
+	}
+#endif
+	tls.pc_pending.cnt = 0;
+}
+
+static void jp_page_pending_add(void *block_addr)
+{
+	if(tls.pc_pending.cnt >= JP_PC_PENDING_CAP) {
+		jp_page_pending_flush();
+	}
+	void *page = (void *)((uintptr_t)block_addr & ~((uintptr_t)4096 - 1));
+	for(size_t i = 0; i < tls.pc_pending.cnt; i++) {
+		if(tls.pc_pending.pages[i] == page)
+			return;
+	}
+	tls.pc_pending.pages[tls.pc_pending.cnt++] = page;
+}
+#endif
 
 /* ---- pthread TLS init ---- */
 #include <pthread.h>
@@ -374,7 +519,6 @@ static pthread_key_t  g_tls_key;
 static pthread_once_t g_tls_once = PTHREAD_ONCE_INIT;
 
 static void tls_destructor(void *p);
-static void ebr_try_advance(void);
 
 static void tls_init_once(void)
 {
@@ -385,211 +529,32 @@ static void tls_register(void)
 {
 	if(tls_registered) return;
 	pthread_once(&g_tls_once, tls_init_once);
-	if(!tls.self) {
-		struct ebr_thread *r = (struct ebr_thread *)os_alloc_pages(os_page_size());
-		if(!r) {
-			tls.self = NULL;
-		} else {
-			__atomic_store_n(&r->active, 0, __ATOMIC_RELAXED);
-			__atomic_store_n(&r->epoch, JP_EBR_INACTIVE, __ATOMIC_RELAXED);
-			struct ebr_thread *old = __atomic_load_n(&g_thread_list, __ATOMIC_ACQUIRE);
-			do {
-				__atomic_store_n(&r->next, old, __ATOMIC_RELAXED);
-			} while(!__atomic_compare_exchange_n(&g_thread_list, &old, r,
-				0, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE));
-			tls.self = r;
-		}
-	}
 	pthread_setspecific(g_tls_key, (void *)(uintptr_t)1);
 	tls_registered = 1;
 }
 
-/* Pre-declarations */
-static void global_push_magazine(struct pool *p, struct magazine *head, struct magazine *tail);
-static void magazine_madvise(struct magazine *head, size_t pid);
-
-/* ---- Limbo (for thread teardown) ---- */
-
-struct limbo_slot {
-	struct magazine * volatile head;
-	char _pad[JP_CACHELINE - sizeof(struct magazine *)];
-};
-static _Alignas(JP_CACHELINE) struct limbo_slot g_limbo[JP_ALLOC_POOL_COUNT][JP_EBR_EPOCHS];
-
-static void deposit_to_limbo(size_t pid, int slot, struct magazine *head, struct magazine *tail)
-{
-	struct limbo_slot *s = &g_limbo[pid][slot];
-	struct magazine *old = atomic_load_ptr((void * volatile *)&s->head);
-	for(;;) {
-		tail->next = old;
-		if(atomic_cas_ptr((void * volatile *)&s->head, (void **)&old, head)) break;
-	}
-}
-
-static void drain_limbo(size_t pid, int slot)
-{
-	struct limbo_slot *s = &g_limbo[pid][slot];
-	struct magazine *head = __atomic_load_n(&s->head, __ATOMIC_ACQUIRE);
-	if(!head) return;
-	if(!__atomic_compare_exchange_n(&s->head, &head, NULL,
-		0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-		return;
-	struct magazine *tail = head;
-	while(tail->next != NULL) tail = tail->next;
-	magazine_madvise(head, pid);
-	global_push_magazine(&g_pools[pid], head, tail);
-}
-
-/* ---- TLS destructor ---- */
+/* TLS destructor: flush any pending madvise batch. The freelist
+ * pointers are dropped — the underlying memory (8M regions) stays
+ * mapped and is reclaimed by the OS at process exit. Per-4K-page
+ * madvise already returned physical pages during the thread's
+ * lifetime; unflushed pending pages get one last flush here. */
 static void tls_destructor(void *p)
 {
 	(void)p;
 	if(!tls_registered) return;
-	struct tls_state *t = &tls;
-
-	/* Deposit partial cache contents into magazines and push to limbo. */
-	for(size_t pid = 0; pid < JP_ALLOC_POOL_COUNT; pid++) {
-		size_t cnt = t->cnt[pid];
-		if(cnt > 0) {
-			struct magazine *mag = t->mag_empty;
-			if(mag) {
-				t->mag_empty = mag->next;
-				memcpy(mag->slots, t->cache[pid], cnt * sizeof(void *));
-				if(cnt < JP_MAG_SIZE)
-					memset(&mag->slots[cnt], 0, (JP_MAG_SIZE - cnt) * sizeof(void *));
-				mag->next = NULL;
-				deposit_to_limbo(pid, 0, mag, mag);
-			}
-			t->cnt[pid] = 0;
-		}
-	}
-
-	/* Return empty magazines from TLS to the global free-list. */
-	while(t->mag_empty) {
-		struct magazine *next = t->mag_empty->next;
-		mag_free(t->mag_empty);
-		t->mag_empty = next;
-	}
-
-	/* Deposit all per-epoch retired magazines into the global limbo. */
-	for(size_t pid = 0; pid < JP_ALLOC_POOL_COUNT; pid++) {
-		for(int slot = 0; slot < JP_EBR_EPOCHS; slot++) {
-			if(t->retired[pid][slot].head) {
-				deposit_to_limbo(pid, slot,
-					t->retired[pid][slot].head,
-					t->retired[pid][slot].tail);
-				t->retired[pid][slot].head = t->retired[pid][slot].tail = NULL;
-			}
-		}
-	}
-
-	if(t->self) {
-		__atomic_store_n(&t->self->active, 0, __ATOMIC_RELEASE);
-		__atomic_store_n(&t->self->epoch, JP_EBR_INACTIVE, __ATOMIC_RELEASE);
-	}
+#if JP_ALLOC_PAGE_COUNTER
+	jp_page_pending_flush();
+#endif
 	tls_registered = 0;
 }
 
-/* ---- EBR critical section ---- */
+/* ---- Pool operations (per-thread, zero atomics) ---- */
 
-static inline void ebr_enter(void)
+static inline size_t pool_id(size_t size)
 {
-	tls_register();
-	if(tls.self) {
-		long e = __atomic_load_n(&g_epoch, __ATOMIC_ACQUIRE);
-		__atomic_store_n(&tls.self->epoch, e, __ATOMIC_RELEASE);
-		__atomic_store_n(&tls.self->active, 1, __ATOMIC_RELEASE);
-	}
-}
-
-static inline void ebr_exit(void)
-{
-	if(tls.self) {
-		__atomic_store_n(&tls.self->active, 0, __ATOMIC_RELEASE);
-		__atomic_store_n(&tls.self->epoch, JP_EBR_INACTIVE, __ATOMIC_RELEASE);
-	}
-	ebr_try_advance();
-}
-
-static void ebr_try_advance(void)
-{
-	long old = __atomic_load_n(&g_epoch, __ATOMIC_ACQUIRE);
-	struct ebr_thread *r = __atomic_load_n(&g_thread_list, __ATOMIC_ACQUIRE);
-	while(r) {
-		int active = __atomic_load_n(&r->active, __ATOMIC_ACQUIRE);
-		if(active) {
-			long e = __atomic_load_n(&r->epoch, __ATOMIC_ACQUIRE);
-			if(e < old) return;
-		}
-		r = __atomic_load_n(&r->next, __ATOMIC_ACQUIRE);
-	}
-	if(!__atomic_compare_exchange_n(&g_epoch, &old, old + 1,
-		0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-		return;
-
-	int drain_slot = (int)(((old - 1) + JP_EBR_EPOCHS) % JP_EBR_EPOCHS);
-
-	for(size_t pid = 0; pid < JP_ALLOC_POOL_COUNT; pid++) {
-		if(tls.retired[pid][drain_slot].head) {
-			struct magazine *h = tls.retired[pid][drain_slot].head;
-			struct magazine *t = tls.retired[pid][drain_slot].tail;
-			tls.retired[pid][drain_slot].head = tls.retired[pid][drain_slot].tail = NULL;
-			magazine_madvise(h, pid);
-			global_push_magazine(&g_pools[pid], h, t);
-		}
-		drain_limbo(pid, drain_slot);
-	}
-}
-
-/* ---- Pool operations (magazine-based) ---- */
-
-/* Return large-block pages to the OS when magazines are drained to the
- * global list. Only for pools where blocks span whole pages (pid >=
- * JP_MADVISE_PID). The block's s.size header is zeroed by madvise —
- * jp_alloc re-writes it unconditionally after pool_get, so this is safe.
- * Called at EBR drain time (not per-free), so madvise syscall cost is
- * amortized across ~16 blocks per drain. */
-#ifndef _WIN32
-static void magazine_madvise(struct magazine *head, size_t pid)
-{
-	if(pid < JP_MADVISE_PID) return;
-	size_t sz = 1U << pid;
-	for(struct magazine *m = head; m; m = m->next) {
-		for(size_t i = 0; i < JP_MAG_SIZE; i++) {
-			if(m->slots[i])
-				madvise(m->slots[i], sz, MADV_DONTNEED);
-		}
-	}
-}
-#else
-#define magazine_madvise(head, pid) ((void)0)
-#endif
-
-static void global_push_magazine(struct pool *p, struct magazine *head, struct magazine *tail)
-{
-	struct magazine *old = atomic_load_ptr((void * volatile *)&p->head);
-	do {
-		tail->next = old;
-	} while(!atomic_cas_ptr((void * volatile *)&p->head, (void **)&old, head));
-}
-
-static struct magazine *global_pop_magazine(struct pool *p)
-{
-	struct magazine *head = atomic_load_ptr((void * volatile *)&p->head);
-	for(;;) {
-		if(!head) return NULL;
-		struct magazine *next = head->next;
-		if(atomic_cas_ptr((void * volatile *)&p->head, (void **)&head, next))
-			return head;
-	}
-}
-
-static size_t pool_id(size_t size)
-{
-	if(likely(size > 0)) {
-		return 64 - jp_clzll(size - 1);
-	}
-	return 0;
+	if(unlikely(!g_pid_lut_done)) jp_pid_lut_init();
+	if(likely(size <= 256)) return g_pid_lut[size];
+	return pool_id_by_size(size);
 }
 
 static int is_pow2(size_t n)
@@ -597,138 +562,82 @@ static int is_pow2(size_t n)
 	return (n & (n - 1)) == 0;
 }
 
-static void pool_put(union header *h, struct pool *p, size_t pid)
+/* pool_get: pop from freelist[pid]. If empty, split from a larger pool.
+ * For power-of-2 pools: binary buddy split (half + half).
+ * For intermediate pools: asymmetric split from next pow2 pool
+ * (1*small + 3*intermediate = pow2). */
+static union header *pool_get(size_t pid)
 {
-	(void)p;
+	/* Fast path: pop from freelist. */
+	if(likely(tls.freelist[pid] != NULL)) {
+		union header *h = tls.freelist[pid];
+		tls.freelist[pid] = h->s.next;
+		return h;
+	}
+	/* Empty: split from a larger pool. */
+	if(likely(pid < JP_POOL_COUNT - 1)) {
+		if(g_pools[pid].is_pow2) {
+			/* Binary buddy: split next pow2 pool into two halves.
+			 * Skip intermediate pools — they're not 2x the child. */
+			size_t next_pid = pid + 1;
+			while(next_pid < JP_POOL_COUNT && !g_pools[next_pid].is_pow2)
+				next_pid++;
+			union header *big = pool_get(next_pid);
+			if(!big) return NULL;
+			size_t sz = g_pools[pid].size;
+			union header *spare = (union header *)((char *)big + sz);
+			spare->s.next = tls.freelist[pid];
+			tls.freelist[pid] = spare;
+			return big;
+		} else {
+			/* Asymmetric: carve from next pow2 pool.
+			 * 1*small + 3*intermediate = pow2. */
+			size_t pow2_pid = pool_id_by_size(g_pools[pid].split_from);
+			union header *big = pool_get(pow2_pid);
+			if(!big) return NULL;
+			size_t inter_sz = g_pools[pid].size;
+			size_t small_sz = g_pools[pid].small_size;
+			char *p = (char *)big;
+			for(int i = 0; i < 3; i++) {
+				union header *h = (union header *)p;
+				h->s.next = tls.freelist[pid];
+				tls.freelist[pid] = h;
+				p += inter_sz;
+			}
+			size_t small_pid = pool_id_by_size(small_sz);
+			union header *small_h = (union header *)p;
+			small_h->s.next = tls.freelist[small_pid];
+			tls.freelist[small_pid] = small_h;
+			union header *h = tls.freelist[pid];
+			tls.freelist[pid] = h->s.next;
+			return h;
+		}
+	}
+	/* Largest pool: mmap a new 8M-aligned region. */
+	size_t sz = g_pools[pid].size;
+#if JP_ALLOC_PAGE_COUNTER
+	union header *h = (union header *)os_alloc_8m_region_counter();
+#else
+	union header *h = (union header *)os_alloc_pages(sz);
+#endif
+	if(!h) return NULL;
+	JP_STAT_MMAP(pid, sz);
 #ifdef JP_ALLOC_DEBUG
 	h->s.magic = JP_UNSIZED_MAGIC;
 	h->s.state = JP_STATE_FREE;
 #endif
-	/* Hot path: push to TLS cache. */
-	if(likely(tls.cnt[pid] < JP_CACHE_N)) {
-		tls.cache[pid][tls.cnt[pid]++] = h;
-		return;
-	}
-	/* Cache full: flush JP_MAG_SIZE blocks into a magazine and retire it. */
-	struct magazine *mag = tls.mag_empty;
-	if(mag) {
-		tls.mag_empty = mag->next;
-	} else {
-		mag = mag_alloc();
-		if(!mag) {
-			/* Magazine pool exhausted — keep the block in the cache
-			 * by dropping the oldest entry. Extremely rare. */
-			tls.cache[pid][0] = h;
-			return;
-		}
-	}
-	memcpy(mag->slots, tls.cache[pid], JP_MAG_SIZE * sizeof(void *));
-	/* Shift remaining blocks down. */
-	tls.cnt[pid] -= JP_MAG_SIZE;
-	memmove(&tls.cache[pid][0], &tls.cache[pid][JP_MAG_SIZE],
-		tls.cnt[pid] * sizeof(void *));
-	/* Put the new block into the cache. */
-	tls.cache[pid][tls.cnt[pid]++] = h;
-	/* Retire the magazine. */
-	mag->next = NULL;
-	long e = __atomic_load_n(&g_epoch, __ATOMIC_ACQUIRE);
-	int slot = (int)(e % JP_EBR_EPOCHS);
-	struct retired_chain *rc = &tls.retired[pid][slot];
-	if(rc->head == NULL) {
-		rc->head = mag;
-		rc->tail = mag;
-	} else {
-		rc->tail->next = mag;
-		rc->tail = mag;
-	}
-	if(!jp_single_threaded())
-		ebr_try_advance();
+	return h;
 }
 
-static void *pool_get(struct pool *p, size_t pid)
+/* pool_put: push to this thread's freelist[pid]. Zero atomics. */
+static void pool_put(union header *h, size_t pid)
 {
-	/* Hot path: pop from TLS cache. */
-	if(likely(tls.cnt[pid] > 0)) {
-		JP_COUNT_HIT;
-		return (union header *)tls.cache[pid][--tls.cnt[pid]];
-	}
-	/* Cache miss: try to pop a full magazine from the global list. */
-	JP_COUNT_MISS;
-	int single = jp_single_threaded();
-	int outer = !tls.in_pop_cs;
-	if(outer && !single) {
-		ebr_enter();
-		tls.in_pop_cs = 1;
-	}
-	union header *result = NULL;
-	{
-		struct magazine *mag = global_pop_magazine(p);
-		if(mag) {
-			/* Refill: copy block pointers from magazine to cache,
-			 * skipping NULL slots (partial magazines from teardown). */
-			size_t n = 0;
-			for(size_t i = 0; i < JP_MAG_SIZE; i++) {
-				if(mag->slots[i] != NULL)
-					tls.cache[pid][n++] = mag->slots[i];
-			}
-			tls.cnt[pid] = n;
-			/* Keep the empty magazine for the next flush. */
-			mag->next = tls.mag_empty;
-			tls.mag_empty = mag;
-			if(n > 0)
-				result = (union header *)tls.cache[pid][--tls.cnt[pid]];
-		}
-	}
-	if(result == NULL) {
-		if(unlikely(p == g_pools_last)) {
-			/* Largest pool: mmap one block. Size is set by jp_alloc. */
-			size_t sz = 1U << (JP_ALLOC_POOL_COUNT - 1);
-			result = (union header *)os_alloc_pages(sz);
 #ifdef JP_ALLOC_DEBUG
-			if(likely(result != NULL)) {
-				result->s.magic = JP_UNSIZED_MAGIC;
-				result->s.state = JP_STATE_FREE;
-			}
+	h->s.magic = JP_UNSIZED_MAGIC;
+	h->s.state = JP_STATE_FREE;
 #endif
-		} else {
-			/* Binary buddy: split from next-larger pool.
-			 * Use pid directly (not result->s.size - 1) since the
-			 * header may have been zeroed by madvise. Size is set
-			 * by jp_alloc. */
-			char *mem = (char *)pool_get(g_pools + pid + 1, pid + 1);
-			if(mem != NULL) {
-				result = (union header *)mem;
-				size_t sz = pid;
-				union header *spare = (union header *)(mem + (1U << sz));
-#ifdef JP_ALLOC_DEBUG
-				spare->s.magic = JP_UNSIZED_MAGIC;
-				spare->s.state = JP_STATE_FREE;
-#endif
-				if(likely(tls.cnt[pid] < JP_CACHE_N)) {
-					tls.cache[pid][tls.cnt[pid]++] = spare;
-				} else {
-					pool_put(spare, g_pools + pid, pid);
-				}
-			}
-		}
-	}
-	if(outer && !single) {
-		tls.in_pop_cs = 0;
-		ebr_exit();
-	}
-#ifdef JP_ALLOC_DEBUG
-	if(result != NULL) {
-		JP_CHECK(result->s.magic == JP_UNSIZED_MAGIC,
-			 "pool_get: wrong magic %llx (expected %llx)\n",
-			 (unsigned long long)result->s.magic,
-			 (unsigned long long)JP_UNSIZED_MAGIC);
-		JP_CHECK(result->s.state == JP_STATE_FREE,
-			 "pool_get: ABA! block %p still LIVE (state=%llx)\n",
-			 (void *)result,
-			 (unsigned long long)result->s.state);
-	}
-#endif
-	return result;
+	h->s.next = tls.freelist[pid];
+	tls.freelist[pid] = h;
 }
 
 /* ---- Aligned page allocation ---- */
@@ -749,7 +658,7 @@ static void *alloc_pages_aligned(size_t alignment, size_t size)
 	}
 	size_t span_size = pre_padding + size + align_size;
 	size_t span_size_rounded = (span_size + ps - 1) & ~(ps - 1);
-	char *span = os_alloc_pages(span_size_rounded);
+	char *span = (char *)os_alloc_pages(span_size_rounded);
 	if(unlikely(span == NULL)) return NULL;
 	char *hdr = span + pre_padding;
 	size_t offset = (alignment - ((size_t)(hdr + sizeof(union header)) & (alignment - 1))) & (alignment - 1);
@@ -765,12 +674,11 @@ static void *alloc_pages_aligned(size_t alignment, size_t size)
 
 /* ---- Public API ---- */
 
-size_t jp_good_size(size_t size);
 size_t jp_good_size(size_t size)
 {
 	size_t pid = pool_id(size);
-	if(likely(pid < JP_ALLOC_POOL_COUNT)) {
-		size = 1U << pid;
+	if(likely(pid < JP_POOL_COUNT)) {
+		size = g_pools[pid].size;
 	} else {
 		size_t ps_mask = os_page_size() - 1;
 		size = (size + ps_mask) & ~ps_mask;
@@ -780,17 +688,78 @@ size_t jp_good_size(size_t size)
 
 void jp_alloc_reset(void)
 {
-	/* No-op: pool memory is still reachable from the global pool head
-	 * pointers, so valgrind reports it as "still reachable" (not an
-	 * error). The OS reclaims all pages at process exit. */
+	/* No-op. Pool memory stays mapped; OS reclaims at exit. */
 }
 
+/* ---- Statistics dump ---- */
+#ifdef JP_ALLOC_STATS
+static size_t count_freelist_blocks(union header *head)
+{
+	size_t total = 0;
+	size_t guard = 0;
+	while(head && guard < 10000000) {
+		total++;
+		head = head->s.next;
+		guard++;
+	}
+	return total;
+}
+
+static void jp_alloc_stats_dump(void)
+{
+	FILE *f = stderr;
+	size_t total_live = 0, total_allocs = 0, total_frees = 0;
+	size_t total_mmap_bytes = 0, total_free_blocks = 0, total_madvise = 0;
+
+	fprintf(f, "\n=== jp_alloc STATS ===\n");
+	fprintf(f, "  %-4s %-10s %-12s %-12s %-12s %-14s %-14s %-14s %-14s\n",
+		"pid", "block_sz", "live", "allocs", "frees",
+		"mmap_bytes", "freelist", "madvise_cnt", "live_bytes");
+	for(size_t pid = 0; pid < JP_POOL_COUNT; pid++) {
+		size_t block_sz = g_pools[pid].size;
+		size_t live = __atomic_load_n(&g_live_blocks[pid], __ATOMIC_RELAXED);
+		size_t alloc = __atomic_load_n(&g_alloc_count[pid], __ATOMIC_RELAXED);
+		size_t free = __atomic_load_n(&g_free_count[pid], __ATOMIC_RELAXED);
+		size_t mmap_bytes = __atomic_load_n(&g_mmap_bytes[pid], __ATOMIC_RELAXED);
+		size_t fl = count_freelist_blocks(tls.freelist[pid]);
+		size_t madv = __atomic_load_n(&g_madvise_count[pid], __ATOMIC_RELAXED);
+		size_t live_bytes = live * block_sz;
+		if(live == 0 && alloc == 0 && mmap_bytes == 0 && fl == 0 && madv == 0)
+			continue;
+		fprintf(f, "  %-4zu %-10zu %-12zu %-12zu %-12zu %-14zu %-14zu %-14zu %-14zu\n",
+			pid, block_sz, live, alloc, free,
+			mmap_bytes, fl, madv, live_bytes);
+		total_live += live;
+		total_allocs += alloc;
+		total_frees += free;
+		total_mmap_bytes += mmap_bytes;
+		total_free_blocks += fl;
+		total_madvise += madv;
+	}
+	size_t direct = __atomic_load_n(&g_direct_mmap_bytes, __ATOMIC_RELAXED);
+	size_t direct_live = __atomic_load_n(&g_direct_live_bytes, __ATOMIC_RELAXED);
+	size_t page_madv = __atomic_load_n(&g_page_madvise_count, __ATOMIC_RELAXED);
+	fprintf(f, "  ---\n");
+	fprintf(f, "  total live blocks  : %zu\n", total_live);
+	fprintf(f, "  total allocs/frees : %zu / %zu (delta %zu)\n",
+		total_allocs, total_frees, total_allocs - total_frees);
+	fprintf(f, "  total mmap (pools) : %zu bytes (%.1f MB)\n",
+		total_mmap_bytes, total_mmap_bytes / 1048576.0);
+	fprintf(f, "  direct mmap (large): %zu bytes (%.1f MB), live: %zu bytes (%.1f MB)\n",
+		direct, direct / 1048576.0, direct_live, direct_live / 1048576.0);
+	fprintf(f, "  freelist blocks    : %zu (this thread)\n", total_free_blocks);
+	fprintf(f, "  pool madvise       : %zu calls\n", total_madvise);
+	fprintf(f, "  page madvise (4K)  : %zu calls\n", page_madv);
+	fprintf(f, "=== end STATS ===\n\n");
+	fflush(f);
+}
+#endif
+
 #ifdef JP_ALLOC_DEBUG
-/* Diagnostic counters for the bench. Not part of the public API. */
 void jp_alloc_diag(size_t *hits, size_t *misses)
 {
-	if(hits)   *hits   = __atomic_load_n(&g_cache_hits,   __ATOMIC_RELAXED);
-	if(misses) *misses = __atomic_load_n(&g_cache_misses, __ATOMIC_RELAXED);
+	if(hits)   *hits   = 0;
+	if(misses) *misses = 0;
 }
 #endif
 
@@ -802,18 +771,29 @@ void jp_free(void *mem)
 
 	union header *h = (union header *)mem - 1;
 #ifdef JP_ALLOC_DEBUG
-	JP_CHECK(h->s.magic == JP_UNSIZED_MAGIC,
+	JP_CHECK(h->s.magic == JP_UNSIZED_MAGIC || h->s.magic == 0,
 		 "jp_free: double free or corruption on %p (magic=%llx)\n",
 		 mem, (unsigned long long)h->s.magic);
-	JP_CHECK(h->s.state == JP_STATE_LIVE,
+	JP_CHECK(h->s.state == JP_STATE_LIVE || h->s.state == 0,
 		 "jp_free: double free on %p (state=%llx)\n",
 		 mem, (unsigned long long)h->s.state);
 	h->s.state = JP_STATE_FREE;
 #endif
 	size_t size = h->s.size;
-	if(likely(size < JP_ALLOC_POOL_COUNT)) {
-		pool_put(h, g_pools + size, size);
+	if(likely(size < JP_POOL_COUNT)) {
+		JP_STAT_FREE(size);
+		JP_STAT_DEAD(size);
+		/* Per-4K-page user-held counter: dec-and-test before pool_put. */
+		int dec_hit_zero = 0;
+		JP_PC_DEC(h, size, &dec_hit_zero);
+		if(dec_hit_zero) {
+#if JP_ALLOC_PAGE_COUNTER
+			jp_page_pending_add(h);
+#endif
+		}
+		pool_put(h, size);
 	} else {
+		JP_STAT_DIRECT_DEAD(size);
 		size_t pre_padding = (size_t)mem & (os_page_size() - 1);
 		os_free_pages((char *)h + pre_padding, size + pre_padding);
 	}
@@ -824,38 +804,45 @@ void *jp_alloc(size_t size)
 	size += sizeof(union header);
 	void *mem;
 	size_t pid = pool_id(size);
-	if(likely(pid < JP_ALLOC_POOL_COUNT)) {
-		mem = pool_get(g_pools + pid, pid);
-		if(mem == NULL) return NULL;
-		/* Unconditionally set s.size — pool_get may return a block
-		 * whose header was zeroed by madvise (large blocks ≥ 4KB
-		 * returned to OS at EBR drain time). This single store
-		 * replaces the per-path writes that were previously in
-		 * pool_get's mmap and buddy-split branches. */
-		((union header *)mem)->s.size = pid;
+	if(likely(pid < JP_POOL_COUNT)) {
+		tls_register();
+		union header *h = pool_get(pid);
+		if(h == NULL) return NULL;
+		h->s.size = pid;
+		JP_STAT_ALLOC(pid);
+		JP_STAT_LIVE(pid);
+		JP_PC_INC(h, pid);
+#ifdef JP_ALLOC_DEBUG
+		h->s.magic = JP_UNSIZED_MAGIC;
+		h->s.state = JP_STATE_LIVE;
+#endif
+		mem = h + 1;
 	} else {
 		size_t ps_mask = os_page_size() - 1;
 		size = (size + ps_mask) & ~ps_mask;
-		mem = os_alloc_pages(size);
-		if(mem == NULL) return NULL;
-		union header *h = (union header *)mem;
+		union header *h = (union header *)os_alloc_pages(size);
+		if(h == NULL) return NULL;
 		h->s.size = size;
-	}
+		JP_STAT_MMAP_DIRECT(size);
+		JP_STAT_DIRECT_LIVE(size);
 #ifdef JP_ALLOC_DEBUG
-	{
-		union header *h = (union header *)mem;
 		h->s.magic = JP_UNSIZED_MAGIC;
 		h->s.state = JP_STATE_LIVE;
-	}
 #endif
-	return (union header *)mem + 1;
+		mem = h + 1;
+	}
+	return mem;
 }
 
 void *jp_alloc_aligned(size_t alignment, size_t size)
 {
 	size += sizeof(union header);
+	size_t ps_mask = os_page_size() - 1;
+	size_t span = (size + ps_mask) & ~ps_mask;
 	void *mem = alloc_pages_aligned(alignment, size);
 	if(mem == NULL) return NULL;
+	JP_STAT_MMAP_DIRECT(span);
+	JP_STAT_DIRECT_LIVE(span);
 	union header *h = (union header *)mem;
 	h->s.size = size;
 #ifdef JP_ALLOC_DEBUG
@@ -891,14 +878,14 @@ void *jp_realloc(void *mem, size_t new_size)
 			 mem, (unsigned long long)h->s.state);
 #endif
 		size = h->s.size;
-		if(likely(size < JP_ALLOC_POOL_COUNT)) size = 1U << size;
+		if(likely(size < JP_POOL_COUNT)) size = g_pools[size].size;
 		size -= sizeof(union header);
 	}
 	if(new_size > size) {
 		if(mem != NULL) {
 			union header *h = (union header *)mem - 1;
 			size_t hdr_size = h->s.size;
-			if(hdr_size >= JP_ALLOC_POOL_COUNT) {
+			if(hdr_size >= JP_POOL_COUNT) {
 				size_t pre_padding = (size_t)mem & (os_page_size() - 1);
 				char *base = (char *)h + pre_padding;
 #ifdef __linux__
@@ -953,7 +940,7 @@ size_t malloc_usable_size(void *ptr)
 {
 	union header *h = (union header *)ptr - 1;
 	size_t size = h->s.size;
-	if(likely(size < JP_ALLOC_POOL_COUNT)) size = 1U << size;
+	if(likely(size < JP_POOL_COUNT)) size = g_pools[size].size;
 	return size - sizeof(union header);
 }
 

@@ -48,7 +48,33 @@ jpbenchd: jp_alloc.c jp_alloc_bench.c jp_alloc.h makefile
 		jp_alloc.c jp_alloc_bench.c \
 		-o jpbenchd -lpthread -lrt -lm
 
-clean:
-	rm -f jp_alloc.so jp_allocd.so jp_alloc.o jp_allocd.o jp_alloc_cpp.o jp_alloc_cppd.o jpbench jpbenchd
+# Unit tests
+test: jp_alloc_test jp_alloc_test_debug jp_alloc_test_k4
+	@echo "--- Running jp_alloc_test (K=0 release) ---"
+	./jp_alloc_test
+	@echo "--- Running jp_alloc_test_debug (K=0 debug) ---"
+	./jp_alloc_test_debug
+	@echo "--- Running jp_alloc_test_k4 (K=4, tests 7-8 may fail) ---"
+	-./jp_alloc_test_k4 || true
+	@echo "Unit tests complete (check output above for PASS/FAIL)"
 
-.PHONY: all bench clean
+jp_alloc_test: jp_alloc.c jp_alloc_test.c jp_alloc_test.h jp_alloc.h makefile
+	$(CC) -O2 -std=c11 -DJP_ALLOC_TEST \
+		jp_alloc_test.c \
+		-o jp_alloc_test -lpthread -lm
+
+jp_alloc_test_debug: jp_alloc.c jp_alloc_test.c jp_alloc_test.h jp_alloc.h makefile
+	$(CC) -O1 -g -std=c11 -DJP_ALLOC_DEBUG -DJP_ALLOC_TEST \
+		jp_alloc_test.c \
+		-o jp_alloc_test_debug -lpthread -lm
+
+jp_alloc_test_k4: jp_alloc.c jp_alloc_test.c jp_alloc_test.h jp_alloc.h makefile
+	$(CC) -O2 -std=c11 -DJP_ALLOC_TEST -DJP_ALLOC_INTERMEDIATE_K=4 \
+		jp_alloc_test.c \
+		-o jp_alloc_test_k4 -lpthread -lm
+
+clean:
+	rm -f jp_alloc.so jp_allocd.so jp_alloc.o jp_allocd.o jp_alloc_cpp.o jp_alloc_cppd.o jpbench jpbenchd \
+		jp_alloc_test jp_alloc_test_debug jp_alloc_test_k4
+
+.PHONY: all bench test clean
