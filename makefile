@@ -64,7 +64,7 @@ jp_alloc_test: jp_alloc.c jp_alloc_test.c jp_alloc_test.h jp_alloc.h makefile
 		-o jp_alloc_test -lpthread -lm
 
 jp_alloc_test_debug: jp_alloc.c jp_alloc_test.c jp_alloc_test.h jp_alloc.h makefile
-	$(CC) -O1 -g -std=c11 -DJP_ALLOC_DEBUG -DJP_ALLOC_TEST \
+	$(CC) -O1 -g -std=c11 -DJP_ALLOC_DEBUG -DJP_ALLOC_TEST -DJP_ALLOC_PAGE_COUNTER=0 \
 		jp_alloc_test.c \
 		-o jp_alloc_test_debug -lpthread -lm
 
